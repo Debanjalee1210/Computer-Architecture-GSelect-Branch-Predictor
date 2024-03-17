@@ -1,0 +1,308 @@
+diff -ruN gem5_clean/src/cpu/pred/BranchPredictor.py gem5/src/cpu/pred/BranchPredictor.py
+--- gem5_clean/src/cpu/pred/BranchPredictor.py	2021-03-24 14:04:51.000000000 -0700
++++ gem5/src/cpu/pred/BranchPredictor.py	2023-10-30 19:04:14.439356132 -0700
+@@ -74,6 +74,14 @@
+ 
+     localPredictorSize = Param.Unsigned(2048, "Size of local predictor")
+     localCtrBits = Param.Unsigned(2, "Bits per counter")
++    
++class GSelectBP(BranchPredictor):
++    type = 'GSelectBP'
++    cxx_class = 'GSelectBP'
++    cxx_header = "cpu/pred/gselect.hh"
++    PredictorSize = Param.Unsigned(256, "Size of gselect predictor") 
++    PHTCtrBits = Param.Unsigned(2, "Bits per counter.")
++    globalHistoryBits = Param.Unsigned(8, "Size of Global Branch History Register")
+ 
+ 
+ class TournamentBP(BranchPredictor):
+diff -ruN gem5_clean/src/cpu/pred/gselect.cc gem5/src/cpu/pred/gselect.cc
+--- gem5_clean/src/cpu/pred/gselect.cc	1969-12-31 17:00:00.000000000 -0700
++++ gem5/src/cpu/pred/gselect.cc	2023-10-30 18:47:53.264561000 -0700
+@@ -0,0 +1,172 @@
++#include "cpu/pred/gselect.hh"
++
++#include "base/intmath.hh"
++#include "base/logging.hh"
++#include "base/trace.hh"
++#include "debug/Fetch.hh"
++#include "debug/GSDebug.hh"
++
++GSelectBP::GSelectBP(const GSelectBPParams& params)
++    : BPredUnit(params)
++    , gSelectPredictorSize(params.PredictorSize)
++    , globalHistoryReg(params.numThreads, 0)
++    , globalHistoryMask(mask(params.globalHistoryBits))
++    , phtCounterBits(params.PHTCtrBits)
++    , predictorCounters(gSelectPredictorSize, SatCounter8(phtCounterBits))
++    , indexMask(mask(params.globalHistoryBits))
++{
++    /*sanity check for invalid size*/
++    if (!isPowerOf2(gSelectPredictorSize)) {
++        fatal("Invalid local predictor size!\n");
++    }
++
++    /*Debug logs*/
++    DPRINTF(GSDebug, "index mask: %#x\n", indexMask);
++
++    DPRINTF(GSDebug, "gselect predictor size: %i\n",
++            gSelectPredictorSize);
++
++    DPRINTF(GSDebug, "PHT counter bits: %i\n", phtCounterBits);
++
++    DPRINTF(GSDebug, "instruction shift amount: %i\n",
++            instShiftAmt);
++}
++
++void GSelectBP::btbUpdate(ThreadID tid, Addr branch_addr, void * &bp_history)
++{
++    DPRINTF(GSDebug, "Inside btbupdate");
++    /* Make the LSB in the global history register 0 to represent NOT Taken if a BTB entry is
++     * invalid or not found*/
++    globalHistoryReg[tid] &= (globalHistoryMask & ~ULL(1)); 
++}
++
++
++bool GSelectBP::lookup(ThreadID tid, Addr branch_addr, void * &bp_history)
++{
++    
++    bool taken;
++    unsigned predictor_idx = getPredictorIndex(branch_addr, globalHistoryReg[tid]);
++
++    /*sanity check before indexing*/
++    assert(predictor_idx < gSelectPredictorSize);
++    DPRINTF(GSDebug, "Looking up index %u\n", predictor_idx);
++
++    BPHistory *history = new BPHistory;
++    /*copy the global history register into BPHistory struct*/
++    history->globalHistoryReg = globalHistoryReg[tid]; 
++
++    /*get the counter value from the pattern history table*/
++    uint8_t counter_val = predictorCounters[predictor_idx];
++    taken = getPrediction(counter_val);
++
++    DPRINTF(GSDebug, "Inside lookup. Global History Register: %u , Branch Address: %#x\n", globalHistoryReg[tid], branch_addr);
++    DPRINTF(GSDebug, "prediction is %i.\n",
++            (int)counter_val);
++
++    /*copy the final prediction into BPHistory struct*/
++    history->finalPred = taken;
++    bp_history = static_cast<void*>(history);
++
++    /*Speculative update of global history register*/
++    updateGlobalHistReg(tid, taken);
++    
++    return taken;
++}
++
++void GSelectBP::update(ThreadID tid, Addr branch_addr, bool taken, void *bp_history,
++                bool squashed, const StaticInstPtr & inst, Addr corrTarget)
++{
++    DPRINTF(GSDebug, "Inside update");
++    /*Sanity check for null pointer*/
++    assert(bp_history);
++    unsigned predictor_idx;
++
++    BPHistory *history = static_cast<BPHistory*>(bp_history);
++
++    // Update the local predictor.
++    predictor_idx = getPredictorIndex(branch_addr, history->globalHistoryReg);
++
++    DPRINTF(GSDebug, "Looking up index %u\n", predictor_idx);
++
++    /*sanity check before indexing*/
++    assert(predictor_idx < gSelectPredictorSize);
++
++    if (taken) {
++        DPRINTF(GSDebug, "Branch updated as taken.\n");
++        /*Increment the counter if taken*/
++        predictorCounters[predictor_idx]++;
++    } else {
++        DPRINTF(GSDebug, "Branch updated as not taken.\n");
++        /*Decrement the counter if NOT taken*/
++        predictorCounters[predictor_idx]--;
++    }
++
++    /*check if branch was mispredicted*/
++    if(squashed)
++    {
++        /*if mispredicted update the global history register based on actual branch execution*/
++        if(taken)
++            globalHistoryReg[tid] = (history->globalHistoryReg << 1) | 1;
++        else
++            globalHistoryReg[tid] = (history->globalHistoryReg << 1);
++            globalHistoryReg[tid] &= globalHistoryMask;
++    }
++    else
++    {
++        /*free the memory*/
++        delete history;
++    }
++}
++
++inline bool GSelectBP::getPrediction(uint8_t &count)
++{
++    DPRINTF(GSDebug, "Inside getPrediction");
++    /*Get the MSB of the count which gives the branch prediction
++      Branch Taken if MSB = 1
++      Branch Not Taken if MSB = 0
++    */
++    return (count >> (phtCounterBits - 1));
++}
++
++inline unsigned GSelectBP::getPredictorIndex(Addr &branch_addr, unsigned historyReg)
++{
++    DPRINTF(GSDebug, "Inside getPredictorIndex");
++    /* Shift the PC, then bitwise AND with mask to obtain lower 8 bits of PC 
++    XNOR 8-bits of global branch history with 8 bits of PC obtained above*/
++    return ~(((branch_addr >> instShiftAmt) & indexMask) ^ historyReg) & globalHistoryMask;
++}
++
++void GSelectBP::uncondBranch(ThreadID tid, Addr pc, void *&bp_history)
++{
++    DPRINTF(GSDebug, "Inside uncondBranch. Global History Register: %u , Branch Address: %#x\n", globalHistoryReg[tid], pc);
++    BPHistory *history = new BPHistory;
++    history->globalHistoryReg = globalHistoryReg[tid];
++    /*Prediction is always Taken for Unconidtional Branches*/
++    history->finalPred = true;
++    bp_history = static_cast<void*>(history);
++    updateGlobalHistReg(tid, true);
++}
++
++void GSelectBP::updateGlobalHistReg(ThreadID tid, bool taken)
++{
++    /*Update the global history register with the latest branch prediction
++      by inserting the branch prediction at the LSB
++      Insert 1 if taken or else insert 0 for NOT taken*/
++    globalHistoryReg[tid] = taken ? (globalHistoryReg[tid] << 1) | 1 :
++                               (globalHistoryReg[tid] << 1);
++    globalHistoryReg[tid] &= globalHistoryMask;
++    DPRINTF(GSDebug, "Inside updateGlobalHistReg. Updated globalHistoryReg: %u", globalHistoryReg[tid]);
++}
++
++void GSelectBP::squash(ThreadID tid, void *bp_history)
++{
++    DPRINTF(GSDebug, "Global History before squashing: %u", globalHistoryReg[tid]);
++    BPHistory *history = static_cast<BPHistory*>(bp_history);
++    /*Restore the global history register from the BPHistory Struct which was updated 
++    before the speculative update of branch history register*/
++    globalHistoryReg[tid] = history->globalHistoryReg;
++    DPRINTF(GSDebug, "Global History after squashing: %u", globalHistoryReg[tid]);
++
++    /*free the memory*/
++    delete history;
++}
+diff -ruN gem5_clean/src/cpu/pred/gselect.hh gem5/src/cpu/pred/gselect.hh
+--- gem5_clean/src/cpu/pred/gselect.hh	1969-12-31 17:00:00.000000000 -0700
++++ gem5/src/cpu/pred/gselect.hh	2023-10-30 18:20:58.134839000 -0700
+@@ -0,0 +1,99 @@
++#ifndef __CPU_PRED_G_SELECT_PRED_HH__
++#define __CPU_PRED_G_SELECT_PRED_HH__
++
++#include <vector>
++
++#include "base/sat_counter.hh"
++#include "base/types.hh"
++#include "cpu/pred/bpred_unit.hh"
++#include "params/GSelectBP.hh"
++
++
++/**
++ * Implements a GSelect predictor that uses the hash of PC and 
++ * global history register to index into a table of counters.
++ */
++class GSelectBP : public BPredUnit
++{
++  public:
++    /**
++     * GSelect branch predictor constructor.
++     */
++    GSelectBP(const GSelectBPParams &params);
++
++    virtual void uncondBranch(ThreadID tid, Addr pc, void * &bp_history);
++
++    /**
++     * Looks up the given address in the branch predictor and returns
++     * a true/false value as to whether it is taken.
++     * @param branch_addr The address of the branch to look up.
++     * @param bp_history Pointer to any bp history state.
++     * @return Whether or not the branch is taken.
++     */
++    bool lookup(ThreadID tid, Addr branch_addr, void * &bp_history);
++
++    /**
++     * Updates the branch predictor to Not Taken if a BTB entry is
++     * invalid or not found.
++     * @param branch_addr The address of the branch to look up.
++     * @param bp_history Pointer to any bp history state.
++     * @return Whether or not the branch is taken.
++     */
++    void btbUpdate(ThreadID tid, Addr branch_addr, void * &bp_history);
++
++    /**
++     * Updates the branch predictor with the actual result of a branch.
++     * @param branch_addr The address of the branch to update.
++     * @param taken Whether or not the branch was taken.
++     */
++    void update(ThreadID tid, Addr branch_addr, bool taken, void *bp_history,
++                bool squashed, const StaticInstPtr & inst, Addr corrTarget);
++
++    /* Function to revert the global history register which was 
++    speculatively updated with branch prediction*/
++    void squash(ThreadID tid, void *bp_history);
++
++  private:
++
++      struct BPHistory {
++        unsigned globalHistoryReg;
++        // the final taken/not-taken prediction
++        // true: predict taken
++        // false: predict not-taken
++        bool finalPred;
++      };
++
++    /**
++     *  Returns the taken/not taken prediction given the value of the
++     *  counter.
++     *  @param count The value of the counter.
++     *  @return The prediction based on the counter value.
++     */
++    inline bool getPrediction(uint8_t &count);
++
++    /** Calculates the predictor index based on the PC & Global History. */
++    inline unsigned getPredictorIndex(Addr &branch_addr, unsigned historyReg);
++
++    /** function to update global history register. */
++    void updateGlobalHistReg(ThreadID tid, bool taken);
++
++    /** Size of the gselect predictor. */
++    const unsigned gSelectPredictorSize;
++
++    /*Global Branch History Register*/
++    std::vector<unsigned> globalHistoryReg;
++
++    /*Mask to get the global history bits*/
++    unsigned globalHistoryMask;
++
++    /** Number of bits of the gselect predictor's counters. */
++    const unsigned phtCounterBits;
++
++    /** Array of counters that make up the gselect predictor. */
++    std::vector<SatCounter8> predictorCounters;
++
++    /** Mask to get index bits. */
++    const unsigned indexMask;
++};
++
++#endif // __CPU_PRED_2BIT_LOCAL_PRED_HH__
+diff -ruN gem5_clean/src/cpu/pred/SConscript gem5/src/cpu/pred/SConscript
+--- gem5_clean/src/cpu/pred/SConscript	2021-03-24 14:04:51.000000000 -0700
++++ gem5/src/cpu/pred/SConscript	2023-10-30 19:04:25.371202423 -0700
+@@ -61,3 +61,7 @@
+ DebugFlag('Tage')
+ DebugFlag('LTage')
+ DebugFlag('TageSCL')
++# Added for Project 2
++Source('gselect.cc')
++DebugFlag('Mispredict')
++DebugFlag('GSDebug')
