@@ -1,5 +1,5 @@
 # Computer Architecture GSelect Branch Predictor
- GSelect Branch Predictor in Gem5\ 
+ GSelect Branch Predictor in Gem5
 In the gem5 simulator a branch predictor (BP) can be implemented by defining
 relevant mechanisms through following functions: lookup, update, uncondBranch,
 btbUpdate, and squash
